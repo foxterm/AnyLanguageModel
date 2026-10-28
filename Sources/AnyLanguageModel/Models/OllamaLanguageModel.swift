@@ -315,27 +315,30 @@ public struct OllamaLanguageModel: LanguageModel {
                             let chunk = try reply.response()
                             state.usage.merge(chunk.reportedUsage)
                             if let piece = chunk.message.content { state.text += piece }
-                            if let piece = chunk.message.thinking { thinking += piece }
+                            if let piece = chunk.message.thinking, !piece.isEmpty {
+                                thinking += piece
+                                // Stream reasoning as it arrives, as one cumulative entry per round
+                                // (replaced as new pieces come in), so the transcript stays compact
+                                // and replaying it to Ollama keeps the original thinking text intact.
+                                if let lastIndex = state.entries.indices.last,
+                                    case .reasoning = state.entries[lastIndex] {
+                                    state.entries[lastIndex] = .reasoning(.ollama(thinking))
+                                } else {
+                                    state.entries.append(.reasoning(.ollama(thinking)))
+                                }
+                            }
                             toolCalls.append(contentsOf: chunk.message.toolCalls ?? [])
-                            if chunk.message.content != nil || chunk.reportedUsage != nil {
+                            // Yield on thinking chunks too, so reasoning streams in before the answer.
+                            if chunk.message.content != nil || chunk.message.thinking != nil || chunk.reportedUsage != nil {
                                 if let snapshot = state.snapshot() { continuation.yield(snapshot) }
                             }
                             if chunk.done { break }
                         }
-                        guard !toolCalls.isEmpty else {
-                            // The final round's reasoning reaches the last snapshot.
-                            if !thinking.isEmpty {
-                                state.entries.append(.reasoning(.ollama(thinking)))
-                                if let snapshot = state.snapshot() { continuation.yield(snapshot) }
-                            }
-                            break
-                        }
+                        guard !toolCalls.isEmpty else { break }
                         try Task.checkCancellation()
                         try toolRounds.record(completed: state.entries)
-                        // The round's reasoning, kept in the transcript before what it led to.
-                        if !thinking.isEmpty {
-                            state.entries.append(.reasoning(.ollama(thinking)))
-                        }
+                        // Reasoning already streamed into state.entries above, before whatever this
+                        // round led to (tool calls or the final response).
                         switch try await resolveToolCalls(
                             toolCalls,
                             tools: offeredTools,
