@@ -25,22 +25,27 @@ import Foundation
     /// visible body. Handles tags that span multiple tokens/chunks by
     /// buffering only the trailing tag-prefix.
     struct ThoughtParser {
-        /// 通用思考段标签对，与剥离逻辑（`stripThoughtSpans`）保持一致
-        private static let pairs: [(open: String, close: String)] = [
+        /// 兜底标签对全集（模型模板检测失败时使用）
+        static let defaultPairs: [(open: String, close: String)] = [
             ("<|startofthink|>", "</|endofthink|>"),
             ("<|begin_of_thought|>", "</|end_of_thought|>"),
             ("<reasoning>", "</reasoning>"),
             ("<thinking>", "</thinking>"),
             ("<think>", "</think>"),
         ]
-        private static let maxTagLength =
-            pairs.flatMap { [$0.open.count, $0.close.count] }.max() ?? 8
-        private static let maxOpenTagLength =
-            pairs.map { $0.open.count }.max() ?? 8
+
+        private let pairs: [(open: String, close: String)]
+        private let maxOpenTagLength: Int
 
         private(set) var thinking = ""
         private var buffer = ""
         private var activeClose: String?
+
+        /// - Parameter pairs: 思考标签对；缺省使用兜底全集。
+        init(pairs: [(open: String, close: String)] = ThoughtParser.defaultPairs) {
+            self.pairs = pairs
+            self.maxOpenTagLength = pairs.map { $0.open.count }.max() ?? 8
+        }
 
         mutating func consume(_ raw: String) {
             buffer += raw
@@ -63,7 +68,7 @@ import Foundation
                 } else {
                     // 非思考：取最早出现的 open 标签
                     var best: (range: Range<String.Index>, close: String)?
-                    for pair in Self.pairs {
+                    for pair in self.pairs {
                         if let r = buffer.range(of: pair.open),
                             best == nil || r.lowerBound < best!.range.lowerBound {
                             best = (r, pair.close)
@@ -74,7 +79,7 @@ import Foundation
                         activeClose = best.close
                     } else {
                         // 保留最长 open 标签前缀，等待下一 chunk 确认
-                        let keep = Self.maxOpenTagLength - 1
+                        let keep = self.maxOpenTagLength - 1
                         if buffer.count > keep {
                             let cut = buffer.index(buffer.endIndex, offsetBy: -keep)
                             buffer = String(buffer[cut...])
@@ -93,6 +98,61 @@ import Foundation
             activeClose = nil
         }
     }
+
+extension ThoughtParser {
+    /// 从 llama 模型元数据（tokenizer.chat_template）动态检测思考标签对，
+    /// 无需针对每个模型写死标签。查不到模板或无思考标签时返回 nil（用兜底全集）。
+    static func detectThoughtSpans(model: OpaquePointer?) -> [(open: String, close: String)]? {
+        guard let model else { return nil }
+        var buffer = [CChar](repeating: 0, count: 65536)
+        let count = llama_model_meta_val_str(
+            model, "tokenizer.chat_template", &buffer, buffer.count
+        )
+        guard count > 0 else { return nil }
+        let template = String(cString: buffer)
+        return thoughtSpanPairs(fromTemplate: template)
+    }
+
+    /// 从 chat template 文本提取思考标签对：
+    /// 1) 已知标签集合匹配（模板里有哪个用哪个，全无则跳过）；
+    /// 2) 通用成对发现：<X>…</X> 且 X 含 think/thought/reasoning 关键词。
+    static func thoughtSpanPairs(fromTemplate template: String) -> [(open: String, close: String)]? {
+        let known: [(open: String, close: String)] = [
+            ("<|startofthink|>", "</|endofthink|>"),
+            ("<|begin_of_thought|>", "</|end_of_thought|>"),
+            ("<reasoning>", "</reasoning>"),
+            ("<thinking>", "</thinking>"),
+            ("<think>", "</think>"),
+        ]
+        let matched = known.filter { template.contains($0.open) }
+        if !matched.isEmpty { return matched }
+
+        // 通用成对发现：<X> 与 </X> 同时出现在模板，且 X 含思考关键词
+        let pattern = #"<(/?)\|?([A-Za-z_]*?(?:think|thought|reasoning)[A-Za-z_]*?)\|?>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let ns = template as NSString
+        var openTags: Set<String> = []
+        var closeTags: Set<String> = []
+        for match in regex.matches(in: template, range: NSRange(location: 0, length: ns.length)) {
+            if let range = Range(match.range, in: template) {
+                let tag = String(template[range])
+                if tag.hasPrefix("</") {
+                    closeTags.insert(tag)
+                } else {
+                    openTags.insert(tag)
+                }
+            }
+        }
+        var pairs: [(open: String, close: String)] = []
+        for open in openTags {
+            let close = "</" + open.dropFirst()
+            if closeTags.contains(close) {
+                pairs.append((open, close))
+            }
+        }
+        return pairs.isEmpty ? nil : pairs
+    }
+}
 
     /// A language model that runs llama.cpp models locally.
     ///
@@ -427,7 +487,8 @@ import Foundation
 
         /// The loaded model instance
         private var model: OpaquePointer?
-
+        /// 从模型 chat template 动态检测出的思考标签对（nil = 用兜底全集）
+        private var detectedThoughtPairs: [(open: String, close: String)]?
         /// The model's vocabulary
         private var vocab: OpaquePointer?
 
@@ -1203,7 +1264,9 @@ import Foundation
                                 var roundRaw = ""
                                 let terminator = toolContext?.format.callTerminator
                                 let withholdToolCalls = toolContext != nil
-                                var thoughtParser = ThoughtParser()
+                                var thoughtParser = ThoughtParser(
+                                    pairs: self.detectedThoughtPairs ?? ThoughtParser.defaultPairs
+                                )
                                 func updateReasoningEntry() {
                                     guard !thoughtParser.thinking.isEmpty else { return }
                                     let reasoningEntry = Transcript.Entry.reasoning(
@@ -1399,6 +1462,7 @@ import Foundation
             self.model = loadedModel
             self.vocab = llama_model_get_vocab(loadedModel)
             self.tokenCache = StructuredGenerationTokenCache()
+            self.detectedThoughtPairs = ThoughtParser.detectThoughtSpans(model: loadedModel)
             self.isModelLoaded = true
         }
 
