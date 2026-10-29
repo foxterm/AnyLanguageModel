@@ -29,7 +29,7 @@ let package = Package(
         .default(enabledTraits: []),
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
+        .package(url: "https://github.com/foxterm/swift-transformers", branch: "main"),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "1.0.0"),
         .package(
             url: "https://github.com/mattt/EventSource",
