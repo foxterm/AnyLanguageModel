@@ -65,8 +65,8 @@ enum LlamaToolCallFormat: Sendable, Equatable {
     /// - 其他常见格式: `<reasoning>...</reasoning>`、`<thinking>...</thinking>`
     static let thoughtSpanPairs: [(open: String, close: String)] = [
         ("<think>", "</think>"),
-        ("<|startofthink|>", "<|endofthink|>"),
-        ("<|begin_of_thought|>", "<|end_of_thought|>"),
+        ("<|startofthink|>", "</|endofthink|>"),
+        ("<|begin_of_thought|>", "</|end_of_thought|>"),
         ("<reasoning>", "</reasoning>"),
         ("<thinking>", "</thinking>"),
     ]

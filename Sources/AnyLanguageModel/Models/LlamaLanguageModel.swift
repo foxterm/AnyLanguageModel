@@ -20,28 +20,38 @@ import Foundation
         }
     }
 
-    /// Incrementally parses `<think>...</think>` spans out of raw generated
-    /// text, streaming the thinking content separately from the visible body.
-    /// Handles tags that span multiple tokens/chunks by buffering only the
-    /// trailing tag-prefix.
+    /// Incrementally parses thinking spans (all common tag pairs) out of raw
+    /// generated text, streaming the thinking content separately from the
+    /// visible body. Handles tags that span multiple tokens/chunks by
+    /// buffering only the trailing tag-prefix.
     struct ThoughtParser {
-        private static let openTag = ""
-        private static let closeTag = " response"
+        /// 通用思考段标签对，与剥离逻辑（`stripThoughtSpans`）保持一致
+        private static let pairs: [(open: String, close: String)] = [
+            ("<|startofthink|>", "</|endofthink|>"),
+            ("<|begin_of_thought|>", "</|end_of_thought|>"),
+            ("<reasoning>", "</reasoning>"),
+            ("<thinking>", "</thinking>"),
+            ("<think>", "</think>"),
+        ]
+        private static let maxTagLength =
+            pairs.flatMap { [$0.open.count, $0.close.count] }.max() ?? 8
+        private static let maxOpenTagLength =
+            pairs.map { $0.open.count }.max() ?? 8
 
         private(set) var thinking = ""
         private var buffer = ""
-        private var inThought = false
+        private var activeClose: String?
 
         mutating func consume(_ raw: String) {
             buffer += raw
             while true {
-                if inThought {
-                    if let close = buffer.range(of: Self.closeTag) {
-                        thinking += buffer[..<close.lowerBound]
-                        buffer = String(buffer[close.upperBound...])
-                        inThought = false
+                if let close = activeClose {
+                    if let found = buffer.range(of: close) {
+                        thinking += buffer[..<found.lowerBound]
+                        buffer = String(buffer[found.upperBound...])
+                        activeClose = nil
                     } else {
-                        let keep = max(Self.closeTag.count - 1, 0)
+                        let keep = close.count - 1
                         if buffer.count > keep {
                             let cut = buffer.index(buffer.endIndex, offsetBy: -keep)
                             thinking += buffer[..<cut]
@@ -51,11 +61,20 @@ import Foundation
                         }
                     }
                 } else {
-                    if let open = buffer.range(of: Self.openTag) {
-                        buffer = String(buffer[open.upperBound...])
-                        inThought = true
+                    // 非思考：取最早出现的 open 标签
+                    var best: (range: Range<String.Index>, close: String)?
+                    for pair in Self.pairs {
+                        if let r = buffer.range(of: pair.open),
+                            best == nil || r.lowerBound < best!.range.lowerBound {
+                            best = (r, pair.close)
+                        }
+                    }
+                    if let best {
+                        buffer = String(buffer[best.range.upperBound...])
+                        activeClose = best.close
                     } else {
-                        let keep = max(Self.openTag.count - 1, 0)
+                        // 保留最长 open 标签前缀，等待下一 chunk 确认
+                        let keep = Self.maxOpenTagLength - 1
                         if buffer.count > keep {
                             let cut = buffer.index(buffer.endIndex, offsetBy: -keep)
                             buffer = String(buffer[cut...])
@@ -65,6 +84,13 @@ import Foundation
                     }
                 }
             }
+        }
+
+        /// 生成结束：flush 剩余 buffer（未闭合的思考段也完整输出）
+        mutating func finalize() {
+            thinking += buffer
+            buffer = ""
+            activeClose = nil
         }
     }
 
@@ -1178,27 +1204,29 @@ import Foundation
                                 let terminator = toolContext?.format.callTerminator
                                 let withholdToolCalls = toolContext != nil
                                 var thoughtParser = ThoughtParser()
+                                func updateReasoningEntry() {
+                                    guard !thoughtParser.thinking.isEmpty else { return }
+                                    let reasoningEntry = Transcript.Entry.reasoning(
+                                        Transcript.Reasoning(
+                                            origin: .llama,
+                                            segments: [.text(
+                                                Transcript.TextSegment(content: thoughtParser.thinking)
+                                            )]
+                                        )
+                                    )
+                                    if let lastIndex = accumulatedEntries.indices.last,
+                                        case .reasoning = accumulatedEntries[lastIndex] {
+                                        accumulatedEntries[lastIndex] = reasoningEntry
+                                    } else {
+                                        accumulatedEntries.append(reasoningEntry)
+                                    }
+                                }
                                 let collectToken: (String) -> Bool = { tokenText in
                                     roundRaw += tokenText
                                     // Stream thinking spans as reasoning transcript entries,
                                     // separate from the visible body text.
                                     thoughtParser.consume(tokenText)
-                                    if !thoughtParser.thinking.isEmpty {
-                                        let reasoningEntry = Transcript.Entry.reasoning(
-                                            Transcript.Reasoning(
-                                                origin: .llama,
-                                                segments: [.text(
-                                                    Transcript.TextSegment(content: thoughtParser.thinking)
-                                                )]
-                                            )
-                                        )
-                                        if let lastIndex = accumulatedEntries.indices.last,
-                                            case .reasoning = accumulatedEntries[lastIndex] {
-                                            accumulatedEntries[lastIndex] = reasoningEntry
-                                        } else {
-                                            accumulatedEntries.append(reasoningEntry)
-                                        }
-                                    }
+                                    updateReasoningEntry()
                                     let visible = outputFormat.streamingVisibleText(
                                         in: roundRaw,
                                         withholdToolCalls: withholdToolCalls
@@ -1239,6 +1267,9 @@ import Foundation
                                 }
 
                                 usage.add(roundUsage)
+                                // Flush any unclosed thinking span into the reasoning entry.
+                                thoughtParser.finalize()
+                                updateReasoningEntry()
                                 // Publish counts before tool execution, which may stop or fail.
                                 yieldSnapshot(lastYieldedText ?? emittedBase)
 
