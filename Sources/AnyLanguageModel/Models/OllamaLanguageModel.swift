@@ -158,6 +158,9 @@ public struct OllamaLanguageModel: LanguageModel {
         if messages.isEmpty {
             messages.append(.init(role: .user, content: prompt.description))
         }
+        if !ollamaTools.isEmpty {
+            messages = injectingToolGuidance(into: messages)
+        }
         let params = try createChatParams(
             model: model,
             messages: messages,
@@ -291,6 +294,9 @@ public struct OllamaLanguageModel: LanguageModel {
                         var messages = try requestContext.transcript.toOllamaMessages()
                         if messages.isEmpty {
                             messages.append(.init(role: .user, content: prompt.description))
+                        }
+                        if !tools.isEmpty {
+                            messages = injectingToolGuidance(into: messages)
                         }
                         messages.append(contentsOf: inFlightMessages)
                         let params = try createChatParams(
@@ -578,6 +584,20 @@ private func convertToolToOllamaFormat(_ tool: any Tool) throws -> [String: JSON
             "parameters": try resolvedSchema.jsonValue(constantsAsEnums: true),
         ]),
     ]
+}
+
+/// Ollama 没有 tool-choice 设置，模型可能选择不调用工具。
+/// tools 非空时在 system 中注入引导消息，保证实时数据类提问会调用工具。
+private func injectingToolGuidance(into messages: [OllamaMessage]) -> [OllamaMessage] {
+    let guidance =
+        "当用户需要实时或外部信息（当前时间、IP地址、地理位置、天气、汇率、域名信息、网页内容等）时，"
+        + "你必须调用提供的工具获取真实结果，不得凭记忆或猜测回答。"
+    guard let first = messages.first, first.role == .system else {
+        return [OllamaMessage(role: .system, content: guidance)] + messages
+    }
+    var result = messages
+    result.insert(OllamaMessage(role: .system, content: guidance), at: 1)
+    return result
 }
 
 private func encodeChatParams(_ params: [String: JSONValue]) throws -> Data {
