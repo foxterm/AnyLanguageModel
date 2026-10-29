@@ -20,6 +20,54 @@ import Foundation
         }
     }
 
+    /// Incrementally parses `<think>...</think>` spans out of raw generated
+    /// text, streaming the thinking content separately from the visible body.
+    /// Handles tags that span multiple tokens/chunks by buffering only the
+    /// trailing tag-prefix.
+    struct ThoughtParser {
+        private static let openTag = ""
+        private static let closeTag = " response"
+
+        private(set) var thinking = ""
+        private var buffer = ""
+        private var inThought = false
+
+        mutating func consume(_ raw: String) {
+            buffer += raw
+            while true {
+                if inThought {
+                    if let close = buffer.range(of: Self.closeTag) {
+                        thinking += buffer[..<close.lowerBound]
+                        buffer = String(buffer[close.upperBound...])
+                        inThought = false
+                    } else {
+                        let keep = max(Self.closeTag.count - 1, 0)
+                        if buffer.count > keep {
+                            let cut = buffer.index(buffer.endIndex, offsetBy: -keep)
+                            thinking += buffer[..<cut]
+                            buffer = String(buffer[cut...])
+                        } else {
+                            break
+                        }
+                    }
+                } else {
+                    if let open = buffer.range(of: Self.openTag) {
+                        buffer = String(buffer[open.upperBound...])
+                        inThought = true
+                    } else {
+                        let keep = max(Self.openTag.count - 1, 0)
+                        if buffer.count > keep {
+                            let cut = buffer.index(buffer.endIndex, offsetBy: -keep)
+                            buffer = String(buffer[cut...])
+                        } else {
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A language model that runs llama.cpp models locally.
     ///
     /// Use this model to generate text using GGUF models running directly with llama.cpp.
@@ -1129,8 +1177,28 @@ import Foundation
                                 var roundRaw = ""
                                 let terminator = toolContext?.format.callTerminator
                                 let withholdToolCalls = toolContext != nil
+                                var thoughtParser = ThoughtParser()
                                 let collectToken: (String) -> Bool = { tokenText in
                                     roundRaw += tokenText
+                                    // Stream thinking spans as reasoning transcript entries,
+                                    // separate from the visible body text.
+                                    thoughtParser.consume(tokenText)
+                                    if !thoughtParser.thinking.isEmpty {
+                                        let reasoningEntry = Transcript.Entry.reasoning(
+                                            Transcript.Reasoning(
+                                                origin: .llama,
+                                                segments: [.text(
+                                                    Transcript.TextSegment(content: thoughtParser.thinking)
+                                                )]
+                                            )
+                                        )
+                                        if let lastIndex = accumulatedEntries.indices.last,
+                                            case .reasoning = accumulatedEntries[lastIndex] {
+                                            accumulatedEntries[lastIndex] = reasoningEntry
+                                        } else {
+                                            accumulatedEntries.append(reasoningEntry)
+                                        }
+                                    }
                                     let visible = outputFormat.streamingVisibleText(
                                         in: roundRaw,
                                         withholdToolCalls: withholdToolCalls

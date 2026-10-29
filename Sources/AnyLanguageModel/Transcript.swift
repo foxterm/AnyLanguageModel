@@ -840,6 +840,8 @@ extension Transcript.Reasoning {
     enum Origin: String, Sendable, Equatable, CaseIterable {
         case anthropic
         case ollama
+        /// Llama (llama.cpp / GGUF) models with embedded thinking spans.
+        case llama
         /// OpenAI's Chat Completions API, or another host that serves it.
         case chatCompletions = "openai.chatCompletions"
     }
