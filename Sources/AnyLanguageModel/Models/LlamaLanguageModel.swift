@@ -1292,7 +1292,8 @@ extension ThoughtParser {
                                     updateReasoningEntry()
                                     let visible = outputFormat.streamingVisibleText(
                                         in: roundRaw,
-                                        withholdToolCalls: withholdToolCalls
+                                        withholdToolCalls: withholdToolCalls,
+                                        thoughtPairs: self.detectedThoughtPairs
                                     )
                                     let total = emittedBase + visible
                                     if !total.isEmpty, total != lastYieldedText {
@@ -1343,7 +1344,8 @@ extension ThoughtParser {
                                 let roundVisible = outputFormat.streamingVisibleText(
                                     in: roundRaw,
                                     withholdToolCalls: withholdToolCalls,
-                                    holdPartialMarkers: false
+                                    holdPartialMarkers: false,
+                                    thoughtPairs: self.detectedThoughtPairs
                                 )
 
                                 guard let format = toolContext?.format else {

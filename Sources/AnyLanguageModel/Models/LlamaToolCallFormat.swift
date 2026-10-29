@@ -73,9 +73,14 @@ enum LlamaToolCallFormat: Sendable, Equatable {
 
     /// 从生成文本中剥离所有思考段（通用标签对）。
     /// 未闭合的思考段从开始处截断到文本末尾（同 Gemma channel 的处理）。
-    static func stripThoughtSpans(from text: String) -> String {
+    /// - Parameter pairs: 模型动态检测出的标签对；nil 使用静态全集。
+    static func stripThoughtSpans(
+        from text: String,
+        pairs: [(open: String, close: String)]? = nil
+    ) -> String {
         var result = text
-        for pair in thoughtSpanPairs {
+        let spanPairs = pairs ?? thoughtSpanPairs
+        for pair in spanPairs {
             result = stripSpans(open: pair.open, close: pair.close, from: result)
         }
         return result
@@ -141,14 +146,16 @@ enum LlamaToolCallFormat: Sendable, Equatable {
     func streamingVisibleText(
         in raw: String,
         withholdToolCalls: Bool,
-        holdPartialMarkers: Bool = true
+        holdPartialMarkers: Bool = true,
+        thoughtPairs: [(open: String, close: String)]? = nil
     ) -> String {
         var text = raw
+        let spanPairs = thoughtPairs ?? Self.thoughtSpanPairs
         if self == .gemma {
             text = Self.stripGemmaThoughtChannels(from: text)
         }
-        // 通用思考段剥离（Qwen3 <think>、Llama4 <|begin_of_thought|> 等）
-        text = Self.stripThoughtSpans(from: text)
+        // 通用思考段剥离（动态检测标签对优先，兜底静态全集）
+        text = Self.stripThoughtSpans(from: text, pairs: spanPairs)
         if withholdToolCalls, let range = text.range(of: callStartMarker) {
             text = String(text[..<range.lowerBound])
         }
@@ -162,7 +169,7 @@ enum LlamaToolCallFormat: Sendable, Equatable {
         if self == .gemma {
             candidates.append(contentsOf: Self.gemmaChannelOpenMarkers)
         }
-        candidates.append(contentsOf: Self.thoughtSpanPairs.map(\.open))
+        candidates.append(contentsOf: spanPairs.map(\.open))
         var cut = 0
         for marker in candidates {
             let maxLength = min(marker.count - 1, text.count)
