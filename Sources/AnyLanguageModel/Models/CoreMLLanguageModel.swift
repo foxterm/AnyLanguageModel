@@ -56,8 +56,26 @@
             }
 
             do {
-                // Load the model with the specified compute units
-                self.model = try Models.LanguageModel.loadCompiled(url: url, computeUnits: computeUnits)
+                // 本地 tokenizer 优先：模型目录含 tokenizer.json 时直接本地加载，避免从 HuggingFace Hub 下载
+                // （本地模型名通常是转换产物名，在 Hub 上不存在）。
+                let modelFolder = url.deletingLastPathComponent()
+                var localTokenizer: (any Tokenizer)? = nil
+                if FileManager.default.fileExists(
+                    atPath: modelFolder.appendingPathComponent("tokenizer.json").path
+                ) {
+                    localTokenizer = try? await AutoTokenizer.from(modelFolder: modelFolder)
+                }
+                if let localTokenizer {
+                    // Load the model with the specified compute units
+                    self.model = try Models.LanguageModel.loadCompiled(
+                        url: url,
+                        computeUnits: computeUnits,
+                        tokenizer: localTokenizer
+                    )
+                } else {
+                    // Load the model with the specified compute units
+                    self.model = try Models.LanguageModel.loadCompiled(url: url, computeUnits: computeUnits)
+                }
             } catch {
                 // Map CoreML errors to our specific error cases
                 throw CoreMLLanguageModelError.modelInvalid(url, underlyingError: error)

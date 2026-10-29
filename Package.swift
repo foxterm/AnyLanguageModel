@@ -100,6 +100,13 @@ let package = Package(
                     package: "async-http-client",
                     condition: .when(traits: ["AsyncHTTPClient"])
                 ),
+            ],
+            swiftSettings: [
+                // 将启用的 trait 同步为源文件编译条件（#if CoreML / #if MLX / #if Llama）
+                .define("CoreML", .when(traits: ["CoreML"])),
+                .define("MLX", .when(traits: ["MLX"])),
+                .define("Llama", .when(traits: ["Llama"])),
+                .define("AsyncHTTPClient", .when(traits: ["AsyncHTTPClient"])),
             ]
         ),
         .macro(
