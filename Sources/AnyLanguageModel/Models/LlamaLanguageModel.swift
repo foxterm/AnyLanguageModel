@@ -487,6 +487,8 @@ extension ThoughtParser {
 
         /// The loaded model instance
         private var model: OpaquePointer?
+        /// 模型原生训练上下文长度（llama_n_ctx_train；GGUF 自带 context_length）
+        private var nativeContextSize: UInt32?
         /// 从模型 chat template 动态检测出的思考标签对（nil = 用兜底全集）
         private var detectedThoughtPairs: [(open: String, close: String)]?
         /// The model's vocabulary
@@ -983,7 +985,10 @@ extension ThoughtParser {
             let imageMarker = mtmdContext != nil ? String(cString: mtmd_default_marker()) : nil
 
             if type == String.self {
-                let maxTokens = runtimeOptions.maximumResponseTokens ?? 8192
+                let maxTokens = Self.resolveMaxTokens(
+                    requested: runtimeOptions.maximumResponseTokens,
+                    contextSize: runtimeOptions.contextSize
+                )
                 let outputFormat = currentToolCallFormat()
                 var toolRounds = ToolRoundLimit(provider: "Llama", options: options)
                 var allEntries: [Transcript.Entry] = []
@@ -1137,7 +1142,10 @@ extension ThoughtParser {
                 }
                 let context = try makeFreshContext(options: runtimeOptions)
                 defer { llama_free(context) }
-                let maxTokens = structuredOptions.maximumResponseTokens ?? 8192
+                let maxTokens = Self.resolveMaxTokens(
+                    requested: structuredOptions.maximumResponseTokens,
+                    contextSize: structuredOptions.contextSize
+                )
                 let (jsonString, usage) = try await generateStructuredJSON(
                     context: context,
                     prompt: fullPrompt,
@@ -1218,7 +1226,10 @@ extension ThoughtParser {
                             try ensureModelLoaded()
 
                             let runtimeOptions = resolvedOptions(from: options)
-                            let maxTokens = runtimeOptions.maximumResponseTokens ?? 8192
+                            let maxTokens = Self.resolveMaxTokens(
+                                requested: runtimeOptions.maximumResponseTokens,
+                                contextSize: runtimeOptions.contextSize
+                            )
                             let outputFormat = self.currentToolCallFormat()
                             var toolRounds = ToolRoundLimit(provider: "Llama", options: options)
                             var accumulatedEntries: [Transcript.Entry] = []
@@ -1465,6 +1476,10 @@ extension ThoughtParser {
             self.vocab = llama_model_get_vocab(loadedModel)
             self.tokenCache = StructuredGenerationTokenCache()
             self.detectedThoughtPairs = ThoughtParser.detectThoughtSpans(model: loadedModel)
+            // 模型原生训练上下文：GGUF 自带 context_length，
+            // 未显式设置时用它作为上下文/输出上限的默认依据
+            let native = llama_n_ctx_train(loadedModel)
+            self.nativeContextSize = native > 0 ? UInt32(native) : nil
             self.isModelLoaded = true
         }
 
@@ -1481,6 +1496,10 @@ extension ThoughtParser {
             var base = defaultOptions
             if let temp = options.temperature {
                 base.temperature = Float(temp)
+            }
+            // 模型原生 context 自动接管默认（用户显式设置仍优先）
+            if let native = nativeContextSize, native > 0 {
+                base.contextSize = native
             }
 
             return ResolvedGenerationOptions(
@@ -1502,6 +1521,10 @@ extension ThoughtParser {
             base.topP = 0.95
             base.repeatPenalty = 1.1
             base.repeatLastN = 64
+            // 模型原生 context 自动接管默认（用户显式设置仍优先）
+            if let native = nativeContextSize, native > 0 {
+                base.contextSize = native
+            }
 
             return ResolvedGenerationOptions(
                 base: base,
@@ -2584,6 +2607,14 @@ extension ThoughtParser {
         private func isTerminalTokenText(_ text: String) -> Bool {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             return Self.terminalTokenTexts.contains(trimmed)
+        }
+
+        /// 输出 token 上限：用户显式设置时取较小者；未设置时按模型
+        /// 原生上下文自动推导（预留 prompt 余量），不再写死固定值。
+        private static func resolveMaxTokens(requested: Int?, contextSize: UInt32) -> Int {
+            let cap = max(256, Int(contextSize) - 512)
+            guard let requested else { return cap }
+            return min(requested, cap)
         }
 
         private func tokenToText(vocab: OpaquePointer, token: llama_token) -> String? {
