@@ -57,6 +57,46 @@ enum LlamaToolCallFormat: Sendable, Equatable {
     /// The marker that closes a Gemma 4 thought channel.
     static let gemmaChannelCloseMarker = "<channel|>"
 
+    /// 常见思考段标签对（open/close）。不同模型的思考标记不同，统一在此剥离，
+    /// 避免"一个模型一套特判"：
+    /// - Qwen3: `<think>...</think>`
+    /// - Qwen2.x 思考微调 / 旧版: `<|startofthink|>...</|endofthink|>`
+    /// - Llama 4: `<|begin_of_thought|>...</|end_of_thought|>`
+    /// - 其他常见格式: `<reasoning>...</reasoning>`、`<thinking>...</thinking>`
+    static let thoughtSpanPairs: [(open: String, close: String)] = [
+        ("<think>", "</think>"),
+        ("<|startofthink|>", "<|endofthink|>"),
+        ("<|begin_of_thought|>", "<|end_of_thought|>"),
+        ("<reasoning>", "</reasoning>"),
+        ("<thinking>", "</thinking>"),
+    ]
+
+    /// 从生成文本中剥离所有思考段（通用标签对）。
+    /// 未闭合的思考段从开始处截断到文本末尾（同 Gemma channel 的处理）。
+    static func stripThoughtSpans(from text: String) -> String {
+        var result = text
+        for pair in thoughtSpanPairs {
+            result = stripSpans(open: pair.open, close: pair.close, from: result)
+        }
+        return result
+    }
+
+    private static func stripSpans(open: String, close: String, from text: String) -> String {
+        var result = ""
+        var remainder = Substring(text)
+        while let openRange = remainder.range(of: open) {
+            result += remainder[..<openRange.lowerBound]
+            let afterOpen = remainder[openRange.upperBound...]
+            if let closeRange = afterOpen.range(of: close) {
+                remainder = afterOpen[closeRange.upperBound...]
+            } else {
+                remainder = Substring("")
+            }
+        }
+        result += remainder
+        return result
+    }
+
     /// Removes Gemma 4 thought-channel spans from generated text. Thinking is
     /// opt-in via `<|think|>`, but the model volunteers thought channels
     /// anyway; the canonical template ships a `strip_thinking` macro for the
@@ -107,6 +147,8 @@ enum LlamaToolCallFormat: Sendable, Equatable {
         if self == .gemma {
             text = Self.stripGemmaThoughtChannels(from: text)
         }
+        // 通用思考段剥离（Qwen3 <think>、Llama4 <|begin_of_thought|> 等）
+        text = Self.stripThoughtSpans(from: text)
         if withholdToolCalls, let range = text.range(of: callStartMarker) {
             text = String(text[..<range.lowerBound])
         }
@@ -120,6 +162,7 @@ enum LlamaToolCallFormat: Sendable, Equatable {
         if self == .gemma {
             candidates.append(contentsOf: Self.gemmaChannelOpenMarkers)
         }
+        candidates.append(contentsOf: Self.thoughtSpanPairs.map(\.open))
         var cut = 0
         for marker in candidates {
             let maxLength = min(marker.count - 1, text.count)
