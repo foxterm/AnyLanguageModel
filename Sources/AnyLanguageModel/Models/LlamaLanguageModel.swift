@@ -848,7 +848,7 @@ import Foundation
             let imageMarker = mtmdContext != nil ? String(cString: mtmd_default_marker()) : nil
 
             if type == String.self {
-                let maxTokens = runtimeOptions.maximumResponseTokens ?? 100
+                let maxTokens = runtimeOptions.maximumResponseTokens ?? 2048
                 let outputFormat = currentToolCallFormat()
                 var toolRounds = ToolRoundLimit(provider: "Llama", options: options)
                 var allEntries: [Transcript.Entry] = []
@@ -1002,7 +1002,7 @@ import Foundation
                 }
                 let context = try makeFreshContext(options: runtimeOptions)
                 defer { llama_free(context) }
-                let maxTokens = structuredOptions.maximumResponseTokens ?? 512
+                let maxTokens = structuredOptions.maximumResponseTokens ?? 2048
                 let (jsonString, usage) = try await generateStructuredJSON(
                     context: context,
                     prompt: fullPrompt,
@@ -1083,7 +1083,7 @@ import Foundation
                             try ensureModelLoaded()
 
                             let runtimeOptions = resolvedOptions(from: options)
-                            let maxTokens = runtimeOptions.maximumResponseTokens ?? 100
+                            let maxTokens = runtimeOptions.maximumResponseTokens ?? 2048
                             let outputFormat = self.currentToolCallFormat()
                             var toolRounds = ToolRoundLimit(provider: "Llama", options: options)
                             var accumulatedEntries: [Transcript.Entry] = []
