@@ -317,7 +317,7 @@ extension ThoughtParser {
             /// for each generation request.
             public static var `default`: Self {
                 .init(
-                    contextSize: 2048,
+                    contextSize: 4096,
                     batchSize: 512,
                     threads: Int32(ProcessInfo.processInfo.processorCount),
                     seed: nil,
@@ -394,7 +394,7 @@ extension ThoughtParser {
             var maximumResponseTokens: Int?
 
             init(
-                contextSize: UInt32 = 2048,
+                contextSize: UInt32 = 4096,
                 batchSize: UInt32 = 512,
                 threads: Int32 = Int32(ProcessInfo.processInfo.processorCount),
                 seed: UInt32 = UInt32.random(in: 0 ... UInt32.max),
@@ -983,7 +983,7 @@ extension ThoughtParser {
             let imageMarker = mtmdContext != nil ? String(cString: mtmd_default_marker()) : nil
 
             if type == String.self {
-                let maxTokens = runtimeOptions.maximumResponseTokens ?? 2048
+                let maxTokens = runtimeOptions.maximumResponseTokens ?? 8192
                 let outputFormat = currentToolCallFormat()
                 var toolRounds = ToolRoundLimit(provider: "Llama", options: options)
                 var allEntries: [Transcript.Entry] = []
@@ -1137,7 +1137,7 @@ extension ThoughtParser {
                 }
                 let context = try makeFreshContext(options: runtimeOptions)
                 defer { llama_free(context) }
-                let maxTokens = structuredOptions.maximumResponseTokens ?? 2048
+                let maxTokens = structuredOptions.maximumResponseTokens ?? 8192
                 let (jsonString, usage) = try await generateStructuredJSON(
                     context: context,
                     prompt: fullPrompt,
@@ -1218,7 +1218,7 @@ extension ThoughtParser {
                             try ensureModelLoaded()
 
                             let runtimeOptions = resolvedOptions(from: options)
-                            let maxTokens = runtimeOptions.maximumResponseTokens ?? 2048
+                            let maxTokens = runtimeOptions.maximumResponseTokens ?? 8192
                             let outputFormat = self.currentToolCallFormat()
                             var toolRounds = ToolRoundLimit(provider: "Llama", options: options)
                             var accumulatedEntries: [Transcript.Entry] = []
