@@ -772,6 +772,12 @@ extension ThoughtParser {
             self.defaultOptions = ResolvedGenerationOptions()
         }
 
+        /// 模型原生上下文窗口长度（读取 GGUF 自带 context_length，
+        /// 经 llama_n_ctx_train 取得）。模型加载前为 nil。
+        public var modelContextSize: UInt32? {
+            nativeContextSize
+        }
+
         deinit {
             if let cached = cachedSessionContext {
                 llama_free(cached.context)

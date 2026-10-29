@@ -85,6 +85,14 @@ public final class LanguageModelSession: @unchecked Sendable {
 
     private let model: any LanguageModel
 
+#if Llama
+    /// 底层模型的本地上下文窗口（仅 Llama 等可查询的本地模型返回非 nil；
+    /// 来自 GGUF 的 context_length）。
+    public var modelContextSize: UInt32? {
+        (model as? LlamaLanguageModel)?.modelContextSize
+    }
+#endif
+
     /// The tools that the model can call during the session.
     ///
     /// For a session created with dynamic instructions, this is empty.
