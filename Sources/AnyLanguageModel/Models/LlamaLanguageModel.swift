@@ -1939,6 +1939,11 @@ extension ThoughtParser {
 
                 // Convert token to text and yield it
                 if let tokenText = tokenToText(vocab: vocab, token: nextToken) {
+                    // EOG / 会话结构标签兜底（GGUF 缺 eos_token_id 时
+                    // llama_vocab_is_eog 失效，按文本拦截）
+                    if isTerminalTokenText(tokenText) {
+                        break
+                    }
                     guard onToken(tokenText) else {
                         break
                     }
@@ -2106,6 +2111,11 @@ extension ThoughtParser {
                 }
 
                 if let tokenText = tokenToText(vocab: vocab, token: nextToken) {
+                    // EOG / 会话结构标签兜底（GGUF 缺 eos_token_id 时
+                    // llama_vocab_is_eog 失效，按文本拦截）
+                    if isTerminalTokenText(tokenText) {
+                        break
+                    }
                     guard onToken(tokenText) else {
                         break
                     }
@@ -2562,6 +2572,20 @@ extension ThoughtParser {
             return Array(UnsafeBufferPointer(start: tokens, count: Int(tokenCount)))
         }
 
+        /// 生成过程中的终止 token 文本（模板 EOG / 会话结构标签）。
+        /// 部分 GGUF 未声明 `eos_token_id`，`llama_vocab_is_eog` 识别不到
+        /// `<|im_end|>` 之类的模板 EOG，导致其被解码成 ◆ 混入正文。
+        /// 此处按文本兜底识别：命中即结束生成且不 yield。
+        private static let terminalTokenTexts: Set<String> = [
+            "<|im_end|>", "<|im_start|>", "<|endoftext|>", "<|eot_id|>",
+            "<|end|>", "<end>", "</s>", "<|tool_call|>", "<|tool_response|>",
+        ]
+
+        private func isTerminalTokenText(_ text: String) -> Bool {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return Self.terminalTokenTexts.contains(trimmed)
+        }
+
         private func tokenToText(vocab: OpaquePointer, token: llama_token) -> String? {
             // First attempt with a reasonable buffer
             var cap: Int32 = 64
@@ -2574,7 +2598,7 @@ extension ThoughtParser {
                 buf,
                 cap,
                 0,
-                false
+                true
             )
 
             if written < 0 {
@@ -2588,7 +2612,7 @@ extension ThoughtParser {
                     buf,
                     cap,
                     0,
-                    false
+                    true
                 )
             }
 
