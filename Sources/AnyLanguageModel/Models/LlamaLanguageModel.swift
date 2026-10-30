@@ -1,4 +1,8 @@
 import Foundation
+#if os(macOS)
+    import Darwin
+    import Darwin.Mach
+#endif
 #if Llama
     import JSONSchema
     import LlamaSwift
@@ -319,7 +323,7 @@ extension ThoughtParser {
                 .init(
                     contextSize: 4096,
                     batchSize: 512,
-                    threads: Int32(ProcessInfo.processInfo.processorCount),
+                    threads: LlamaLanguageModel.recommendedThreadCount(),
                     seed: nil,
                     temperature: 0.8,
                     topK: 40,
@@ -396,7 +400,7 @@ extension ThoughtParser {
             init(
                 contextSize: UInt32 = 4096,
                 batchSize: UInt32 = 512,
-                threads: Int32 = Int32(ProcessInfo.processInfo.processorCount),
+                threads: Int32 = LlamaLanguageModel.recommendedThreadCount(),
                 seed: UInt32 = UInt32.random(in: 0 ... UInt32.max),
                 temperature: Float = 0.8,
                 topK: Int32 = 40,
@@ -515,6 +519,44 @@ extension ThoughtParser {
 
         /// Whether the model is currently loaded. Protected by `modelLoadLock`.
         private var isModelLoaded: Bool = false
+
+        /// 加载时的内存估算基线（模型权重 + 缓冲），运行时内存护栏据此计算阈值。
+        private var memoryLoadEstimateBytes: UInt64 = 0
+
+        /// 推理串行门：同一模型实例同一时刻只允许一个生成在跑。
+        /// 并发 llama_decode 共享同一 context/batch/tokenCache，竞争会导致崩溃或卡死，
+        /// 所有生成入口（文本/JSON）都经过这里串行化，后续请求排队而非并发。
+        private let inferenceGate = DispatchSemaphore(value: 1)
+
+        /// 最近一次生成的 token/s（性能报告读取；inferenceGate 内串行写、statsLock 保护）
+        private var lastTokensPerSecond: Double = 0
+        private let statsLock = NSLock()
+
+        /// 结构化 JSON 生成的串行门（async 安全）：JSON 生成与文本生成共享
+        /// 同一 model 实例与 tokenCache，必须串行执行。async 上下文不能同步
+        /// wait DispatchSemaphore，故用 actor 信号量实现。
+        private actor InferenceGate {
+            private var waiters: [CheckedContinuation<Void, Never>] = []
+            private var locked = false
+
+            func acquire() async {
+                if !locked {
+                    locked = true
+                    return
+                }
+                await withCheckedContinuation { waiters.append($0) }
+            }
+
+            func release() {
+                if waiters.isEmpty {
+                    locked = false
+                } else {
+                    waiters.removeFirst().resume()
+                }
+            }
+        }
+
+        private let structuredGate = InferenceGate()
 
         /// A context kept alive for one session so exchanges reuse its state.
         private struct CachedSessionContext {
@@ -1440,6 +1482,10 @@ extension ThoughtParser {
                 throw LlamaLanguageModelError.invalidModelPath
             }
 
+            // 加载前内存预检：llama.cpp 在内存耗尽时会直接 abort()（进程级崩溃，
+            // 无异常可捕获），这里提前估算并拦截，避免把整机内存打满导致系统卡死。
+            try ensureSufficientMemoryForLoading()
+
             // Initialize backend lazily - must be done before loading model
             llama_backend_init()
 
@@ -1487,6 +1533,202 @@ extension ThoughtParser {
             let native = llama_n_ctx_train(loadedModel)
             self.nativeContextSize = native > 0 ? UInt32(native) : nil
             self.isModelLoaded = true
+        }
+
+        /// 加载前内存预检：估算 GGUF 权重 + 计算缓冲所需内存，
+        /// 可用内存不足时提前抛 `insufficientMemory`，避免 llama.cpp 内部分配失败
+        /// 调用 abort() 直接终止进程（该路径无异常可捕获，会让 App/系统直接卡死）。
+        private func ensureSufficientMemoryForLoading() throws {
+            let fileSize: UInt64
+            do {
+                let attrs = try FileManager.default.attributesOfItem(atPath: modelPath)
+                fileSize = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+            } catch {
+                throw LlamaLanguageModelError.invalidModelPath
+            }
+            guard fileSize > 0 else {
+                throw LlamaLanguageModelError.invalidModelPath
+            }
+
+            #if os(macOS)
+            // 权重 + 推理/计算缓冲保守按 1.5 倍估算；多模态投影器另计
+            var estimate = Double(fileSize) * 1.5
+            if let mmprojPath {
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: mmprojPath),
+                   let m = (attrs[.size] as? NSNumber)?.uint64Value {
+                    estimate += Double(m) * 1.2
+                }
+            }
+            let available = Double(Self.availableMemoryBytes())
+            // 记录估算基线供运行时护栏使用
+            memoryLoadEstimateBytes = UInt64(estimate)
+            // 保留 20% 余量，防止整机进入内存压力
+            if estimate > available * 0.8 {
+                throw LlamaLanguageModelError.insufficientMemory(
+                    requiredBytes: UInt64(estimate),
+                    availableBytes: UInt64(available)
+                )
+            }
+            #endif
+        }
+
+        /// 运行时内存护栏：推理中 KV cache 随上下文持续增长、系统内存动态变化，
+        /// 每 N 个 token 检查一次系统可用内存，低于阈值立即中断生成。
+        /// 这避免 llama.cpp 在内存耗尽时调用 abort() 把整机干死机。
+        private func checkRuntimeMemoryPressure() throws {
+            #if os(macOS)
+            let free = Self.availableMemoryBytes()
+            // 阈值：模型估算的 1/4，保底 1GB；低于即认为内存吃紧并提前停止。
+            // 留足余量，避免 macOS 内存压缩/换页导致整机卡顿（鼠标都动不了）。
+            let lowerBound = max(memoryLoadEstimateBytes / 4, 1 * 1024 * 1024 * 1024)
+            if free < lowerBound {
+                throw LlamaLanguageModelError.insufficientMemory(
+                    requiredBytes: memoryLoadEstimateBytes,
+                    availableBytes: free
+                )
+            }
+            #endif
+        }
+
+        /// 推荐推理线程数：取物理核心的一半（保底 2）。
+        /// llama.cpp 每个线程占一个 CPU 核心全速运算，默认用全部核心会让
+        /// 推理占满整机 CPU，UI 与系统其他应用全部卡顿。
+        private static func recommendedThreadCount() -> Int32 {
+            #if os(macOS)
+            var physical = 0
+            var size = MemoryLayout<Int>.size
+            if sysctlbyname("hw.physicalcpu", &physical, &size, nil, 0) == 0, physical > 0 {
+                return Int32(max(2, physical / 2))
+            }
+            #endif
+            let logical = ProcessInfo.processInfo.processorCount
+            return Int32(max(2, logical / 2))
+        }
+
+        /// macOS 当前可用内存（free + inactive 可回收页）。
+        /// 注意：`os_proc_available_memory()` 是 iOS 专用 API，macOS 上不可用。
+        #if os(macOS)
+            private static func availableMemoryBytes() -> UInt64 {
+                var stats = vm_statistics64()
+                var count = mach_msg_type_number_t(
+                    MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size
+                )
+                let result = withUnsafeMutablePointer(to: &stats) {
+                    $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                        host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+                    }
+                }
+                guard result == KERN_SUCCESS else {
+                    return ProcessInfo.processInfo.physicalMemory
+                }
+                let pageSize = UInt64(sysconf(Int32(_SC_PAGESIZE)))
+                return (UInt64(stats.free_count) + UInt64(stats.inactive_count)) * pageSize
+            }
+
+            /// 本进程实际物理内存占用（phys_footprint，含 Metal/统一内存分配）。
+            private static func processFootprintBytes() -> UInt64 {
+                var info = task_vm_info_data_t()
+                var count = mach_msg_type_number_t(
+                    MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size
+                )
+                let kr = withUnsafeMutablePointer(to: &info) {
+                    $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+                    }
+                }
+                guard kr == KERN_SUCCESS else { return 0 }
+                return UInt64(info.phys_footprint)
+            }
+
+            /// 本进程实际 CPU 使用率（proc_pidinfo 的 user+system 差分，归一化到单核 0-100%）。
+            /// 注意：host_cpu_load_info 的 idle tick 在 Apple Silicon 上不更新（恒显示 100%），
+            /// 所以不用系统级采样，改用进程级 CPU 时间。
+            private final class ProcessCPUSampleState: @unchecked Sendable {
+                let lock = NSLock()
+                var last: (cpuSeconds: Double, wall: CFAbsoluteTime)?
+            }
+            private static let processCPUSampleState = ProcessCPUSampleState()
+
+            private static func processCPUPercent() -> Double {
+                var info = proc_taskinfo()
+                let size = MemoryLayout<proc_taskinfo>.size
+                let r = proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &info, Int32(size))
+                guard r == size else { return 0 }
+                // pti_total_user / pti_total_system 单位为微秒
+                let cpuSeconds = Double(info.pti_total_user + info.pti_total_system) / 1_000_000
+                processCPUSampleState.lock.lock()
+                defer { processCPUSampleState.lock.unlock() }
+                guard let last = processCPUSampleState.last, cpuSeconds >= last.cpuSeconds else {
+                    processCPUSampleState.last = (cpuSeconds, CFAbsoluteTimeGetCurrent())
+                    return 0
+                }
+                let now = CFAbsoluteTimeGetCurrent()
+                let dt = max(now - last.wall, 0.05)
+                let dCPU = cpuSeconds - last.cpuSeconds
+                processCPUSampleState.last = (cpuSeconds, now)
+                let ncpu = Double(ProcessInfo.processInfo.activeProcessorCount)
+                let pct = dCPU / dt * 100 / ncpu
+                return min(max(pct, 0), 100)
+            }
+        #endif
+
+        /// 本地模型性能快照：权重/参数/上下文/KV cache/进程内存/系统可用/CPU/速度。
+        public struct LlamaPerformanceSnapshot: Sendable {
+            /// GGUF 模型权重字节数（llama_model_size）
+            public let modelSizeBytes: UInt64
+            /// 模型参数量
+            public let parameterCount: UInt64
+            /// 当前上下文已用 token 数
+            public let contextTokens: UInt32
+            /// KV cache 估算字节（context × 层 × 维度 × 4，f16）
+            public let kvCacheBytes: UInt64
+            /// 本进程实际物理内存占用（phys_footprint，统一内存含 GPU 分配）
+            public let processFootprintBytes: UInt64
+            /// 系统当前可用内存
+            public let availableSystemBytes: UInt64
+            /// 本进程 CPU 使用率（归一化到单核，0-100%）
+            public let systemCPUPercent: Double
+            /// 最近一次生成速度（token/秒）
+            public let tokensPerSecond: Double
+            /// Metal 卸载层数（-1 = 全部卸载到 GPU）
+            public let gpuLayers: Int32
+        }
+
+        /// 本地模型性能快照（权重/参数/KV cache/进程内存/系统可用/CPU/速度）。
+        /// 模型未加载或非 macOS 返回 nil。
+        public func performanceSnapshot() -> LlamaPerformanceSnapshot? {
+            guard isModelLoaded, let model else { return nil }
+            #if os(macOS)
+            let size = llama_model_size(model)
+            let params = llama_model_n_params(model)
+            let nLayer = Int32(llama_model_n_layer(model))
+            let nEmbd = Int32(llama_model_n_embd(model))
+            var ctxTokens: UInt32 = 0
+            var kvBytes: UInt64 = 0
+            sessionContextLock.lock()
+            if let cached = cachedSessionContext?.context {
+                ctxTokens = llama_n_ctx(cached)
+                // KV cache ≈ context tokens × 层数 × 维度 × 2(K+V) × 2(f16)
+                kvBytes = UInt64(ctxTokens) * UInt64(max(nLayer, 1)) * UInt64(max(nEmbd, 1)) * 4
+            }
+            sessionContextLock.unlock()
+            statsLock.lock()
+            let tps = lastTokensPerSecond
+            statsLock.unlock()
+            return LlamaPerformanceSnapshot(
+                modelSizeBytes: size,
+                parameterCount: params,
+                contextTokens: ctxTokens,
+                kvCacheBytes: kvBytes,
+                processFootprintBytes: Self.processFootprintBytes(),
+                availableSystemBytes: Self.availableMemoryBytes(),
+                systemCPUPercent: Self.processCPUPercent(),
+                tokensPerSecond: tps,
+                gpuLayers: gpuLayers
+            )
+            #else
+            return nil
+            #endif
         }
 
         private func createModelParams() -> llama_model_params {
@@ -1648,6 +1890,32 @@ extension ThoughtParser {
             maxTokens: Int,
             options: ResolvedGenerationOptions
         ) async throws -> (String, LanguageModelSession.Usage) {
+            // 推理串行门（async 安全）：结构化生成与文本生成共享同一模型/tokenCache，
+            // 经 actor 串行执行，避免并发访问 tokenCache / 竞争模型状态。
+            await structuredGate.acquire()
+            do {
+                let result = try await self.performStructuredGeneration(
+                    context: context,
+                    prompt: prompt,
+                    schema: schema,
+                    maxTokens: maxTokens,
+                    options: options
+                )
+                await structuredGate.release()
+                return result
+            } catch {
+                await structuredGate.release()
+                throw error
+            }
+        }
+
+        private func performStructuredGeneration(
+            context: OpaquePointer,
+            prompt: String,
+            schema: GenerationSchema,
+            maxTokens: Int,
+            options: ResolvedGenerationOptions
+        ) async throws -> (String, LanguageModelSession.Usage) {
             guard let vocab = llama_model_get_vocab(model!) else {
                 throw LlamaLanguageModelError.contextInitializationFailed
             }
@@ -1707,7 +1975,8 @@ extension ThoughtParser {
                 position: initialPosition,
                 maximumTokens: maxTokens,
                 endTokens: [],
-                tokenToTextFn: { [self] token in self.tokenToText(vocab: vocab, token: llama_token(token)) }
+                tokenToTextFn: { [self] token in self.tokenToText(vocab: vocab, token: llama_token(token)) },
+                memoryCheckFn: { [self] in try self.checkRuntimeMemoryPressure() }
             )
             var generator = try ConstrainedJSONGenerator(backend: backend, schema: schema, tokenCache: tokenCache)
             let json = try await generator.generate()
@@ -1729,6 +1998,10 @@ extension ThoughtParser {
             let tokenToTextFn: (Int) -> String?
             let tokensExcludedFromRepetitionPenalty: Set<Int>
             let endTokens: Set<Int>
+            /// 运行时内存护栏（结构化生成路径每 64 token 调用一次）
+            let memoryCheckFn: (() throws -> Void)?
+            /// decode 调用计数（用于按频率触发内存检查）
+            private var decodeCount = 0
 
             var position: Int32
             var remainingTokens: Int
@@ -1744,7 +2017,8 @@ extension ThoughtParser {
                 position: Int32,
                 maximumTokens: Int,
                 endTokens: Set<Int>? = nil,
-                tokenToTextFn: @escaping (Int) -> String?
+                tokenToTextFn: @escaping (Int) -> String?,
+                memoryCheckFn: (() throws -> Void)? = nil
             ) {
                 self.context = context
                 self.vocab = vocab
@@ -1755,6 +2029,7 @@ extension ThoughtParser {
                 self.remainingTokens = maximumTokens
                 self.totalTokenBudget = maximumTokens
                 self.eosToken = Int(llama_vocab_eos(vocab))
+                self.memoryCheckFn = memoryCheckFn
 
                 if let endTokens {
                     self.endTokens = endTokens
@@ -1819,6 +2094,12 @@ extension ThoughtParser {
             }
 
             mutating func decode(_ token: Int) async throws {
+                decodeCount += 1
+                // 结构化生成路径的运行时内存护栏（每 64 token 检查一次）
+                if decodeCount % 64 == 0, let memoryCheckFn {
+                    try memoryCheckFn()
+                }
+
                 let llamaToken = llama_token(token)
 
                 batch.pointee.n_tokens = 1
@@ -1887,6 +2168,19 @@ extension ThoughtParser {
             options: ResolvedGenerationOptions,
             onToken: (String) -> Bool
         ) throws -> LanguageModelSession.Usage {
+            // 推理串行门：同一实例同时只允许一个生成，避免共享 context/batch 竞争
+            inferenceGate.wait()
+            defer { inferenceGate.signal() }
+
+            let generationStart = Date()
+            var generatedTokenCount = 0
+            defer {
+                statsLock.lock()
+                let elapsed = Date().timeIntervalSince(generationStart)
+                lastTokensPerSecond = elapsed > 0 ? Double(generatedTokenCount) / elapsed : 0
+                statsLock.unlock()
+            }
+
             guard let model = self.model else {
                 throw LlamaLanguageModelError.modelLoadFailed
             }
@@ -1952,7 +2246,12 @@ extension ThoughtParser {
             )
             var decodedTokens = promptTokens
 
-            for _ in 0 ..< maxTokens {
+            for tokenIndex in 0 ..< maxTokens {
+                // 运行时内存护栏：KV cache 随上下文增长，内存动态变化，
+                // 每 64 token 检查一次系统可用内存，吃紧即中断（而非等 abort 干死机）
+                if tokenIndex % 64 == 0 {
+                    try checkRuntimeMemoryPressure()
+                }
                 if Task.isCancelled {
                     break
                 }
@@ -1995,6 +2294,7 @@ extension ThoughtParser {
                     break
                 }
                 decodedTokens.append(nextToken)
+                generatedTokenCount += 1
             }
 
             recordCachedTokens(decodedTokens, context: context)
@@ -2019,6 +2319,10 @@ extension ThoughtParser {
             options: ResolvedGenerationOptions,
             onToken: (String) -> Bool
         ) throws -> LanguageModelSession.Usage {
+            // 推理串行门：多模态生成与文本/JSON 生成共享同一模型实例，必须串行
+            inferenceGate.wait()
+            defer { inferenceGate.signal() }
+
             guard let mtmdContext, let model = self.model,
                 let vocab = llama_model_get_vocab(model)
             else {
@@ -2226,7 +2530,7 @@ extension ThoughtParser {
 
             // Encoder models ingest the full prompt in a single llama_encode call.
             guard !hasEncoder || (startIndex == 0 && promptTokens.count <= batchSize) else {
-                throw LlamaLanguageModelError.insufficientMemory
+                throw LlamaLanguageModelError.insufficientMemory(requiredBytes: 0, availableBytes: 0)
             }
 
             if hasEncoder {
@@ -2676,7 +2980,7 @@ extension ThoughtParser {
         case encodingFailed
         case decodingFailed
         case invalidModelPath
-        case insufficientMemory
+        case insufficientMemory(requiredBytes: UInt64, availableBytes: UInt64)
         case promptExceedsContextWindow
         case unsupportedFeature
         case encoderOnlyModel
@@ -2695,7 +2999,13 @@ extension ThoughtParser {
                 return "Failed to decode response"
             case .invalidModelPath:
                 return "Invalid model file path"
-            case .insufficientMemory:
+            case let .insufficientMemory(requiredBytes, availableBytes):
+                if requiredBytes > 0 {
+                    let gb = 1_073_741_824.0
+                    let req = String(format: "%.1f", Double(requiredBytes) / gb)
+                    let avail = String(format: "%.1f", Double(availableBytes) / gb)
+                    return "Insufficient memory to load model (needs ~\(req) GB, \(avail) GB available). Close other apps or use a smaller model."
+                }
                 return "Insufficient memory for operation"
             case .promptExceedsContextWindow:
                 return "Prompt is longer than the model's context window"

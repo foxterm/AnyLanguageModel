@@ -91,6 +91,12 @@ public final class LanguageModelSession: @unchecked Sendable {
     public var modelContextSize: UInt32? {
         (model as? LlamaLanguageModel)?.modelContextSize
     }
+
+    /// 本地 Llama 模型性能快照（权重/参数/内存占用/系统可用/CPU/速度）。
+    /// 云端模型返回 nil。
+    public var localModelPerformance: LlamaLanguageModel.LlamaPerformanceSnapshot? {
+        (model as? LlamaLanguageModel)?.performanceSnapshot()
+    }
 #endif
 
     /// The tools that the model can call during the session.
@@ -104,6 +110,19 @@ public final class LanguageModelSession: @unchecked Sendable {
     ///   It's public so that language models outside this module
     ///   can read the session's tools.
     public let tools: [any Tool]
+
+    /// 动态工具覆盖：非 nil 时优先用于每次请求（工具开关实时生效，
+    /// 无需重建会话/重新创建模型；本地 Llama 模型因此不必重载 GGUF）。
+    @ObservationIgnored private var dynamicTools: [any Tool]?
+    @ObservationIgnored private let dynamicToolsLock = NSLock()
+
+    /// 更新会话工具集（运行中实时生效，不重建模型，不打断上下文）。
+    /// 下次模型请求（respond / stream）即使用新工具。
+    nonisolated public func setDynamicTools(_ tools: [any Tool]) {
+        dynamicToolsLock.lock()
+        dynamicTools = tools
+        dynamicToolsLock.unlock()
+    }
 
     /// The instructions for the session, if any.
     ///
@@ -175,8 +194,13 @@ public final class LanguageModelSession: @unchecked Sendable {
     ///   It's public so that language models outside this module
     ///   can read the inputs for each request.
     nonisolated public func resolvedRequestContext() -> RequestContext {
+        // 动态工具覆盖优先；未设置时用创建时的 tools
+        dynamicToolsLock.lock()
+        let effectiveTools = dynamicTools ?? tools
+        dynamicToolsLock.unlock()
+
         guard let dynamicInstructions else {
-            return RequestContext(transcript: transcript, instructions: instructions, tools: tools)
+            return RequestContext(transcript: transcript, instructions: instructions, tools: effectiveTools)
         }
 
         // Evaluate the body for this request.

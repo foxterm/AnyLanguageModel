@@ -29,7 +29,8 @@ let package = Package(
         .default(enabledTraits: []),
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
+        // fork（main 分支含 underscore 输入名修复 c2cfb40，已 push）
+        .package(url: "https://github.com/foxterm/swift-transformers.git", branch: "main"),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "1.0.0"),
         .package(
             url: "https://github.com/mattt/EventSource",
