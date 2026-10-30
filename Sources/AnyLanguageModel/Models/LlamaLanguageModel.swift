@@ -1640,9 +1640,10 @@ extension ThoughtParser {
                 return UInt64(info.phys_footprint)
             }
 
-            /// 本进程实际 CPU 使用率（proc_pidinfo 的 user+system 差分，归一化到单核 0-100%）。
-            /// 注意：host_cpu_load_info 的 idle tick 在 Apple Silicon 上不更新（恒显示 100%），
-            /// 所以不用系统级采样，改用进程级 CPU 时间。
+            // CPU 采集暂不启用：
+            // 进程级采样（proc_pidinfo）本身正确（空闲 0%，忙时真实占用），
+            // 但当前无需在性能行展示 CPU，保留实现待后续需要时恢复。
+            /*
             private final class ProcessCPUSampleState: @unchecked Sendable {
                 let lock = NSLock()
                 var last: (cpuSeconds: Double, wall: CFAbsoluteTime)?
@@ -1670,6 +1671,7 @@ extension ThoughtParser {
                 let pct = dCPU / dt * 100 / ncpu
                 return min(max(pct, 0), 100)
             }
+            */
         #endif
 
         /// 本地模型性能快照：权重/参数/上下文/KV cache/进程内存/系统可用/CPU/速度。
@@ -1722,7 +1724,7 @@ extension ThoughtParser {
                 kvCacheBytes: kvBytes,
                 processFootprintBytes: Self.processFootprintBytes(),
                 availableSystemBytes: Self.availableMemoryBytes(),
-                systemCPUPercent: Self.processCPUPercent(),
+                systemCPUPercent: 0, // CPU 采集暂不启用（processCPUPercent 已注释）
                 tokensPerSecond: tps,
                 gpuLayers: gpuLayers
             )
